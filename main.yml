@@ -1,0 +1,904 @@
+
+##==================================================================================##
+# 1. Root Password Change
+##==================================================================================##
+- name: Change root password
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    new_root_password: "welcome@123"
+  tags:
+    - root_pw
+
+  tasks:
+    - name: Set root password
+      user:
+        name: root
+        password: "{{ new_root_password | password_hash('sha512') }}"
+      register: root_pw_result
+      ignore_errors: yes
+
+    - name: Log root password change
+      import_tasks: log_task_status.yml
+      vars:
+        task_result: "{{ root_pw_result }}"
+        task_name: "root_pw"
+
+
+##==================================================================================##
+# 2. Hostname Change
+##==================================================================================##
+- name: Change System Hostname
+  hosts: all
+  become: yes
+  gather_facts: no
+  tags:
+    - hostname
+  
+  tasks:
+    - block:
+        - name: Set new hostname using inventory name
+          hostname:
+            name: "{{ inventory_hostname }}"
+          register: hostname_result
+          ignore_errors: yes
+
+        
+      rescue:
+        - name: Mark hostname change as failed
+          set_fact:
+            hostname_result:
+              failed: true
+              msg: "Hostname change failed for {{ inventory_hostname }}"
+
+      always:
+        - name: Log hostname change
+          import_tasks: log_task_status.yml
+          vars:
+            task_result: "{{ hostname_result }}"
+            task_name: "hostname_change"
+          ignore_errors: yes  
+
+
+##==================================================================================##
+# 3. DNS Configuration (Ubuntu 24.04 / systemd-resolved)
+##==================================================================================##
+- name: Configure DNS on Ubuntu 24.04 using systemd-resolved
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - resolv
+
+  vars:
+    date_suffix: "{{ ansible_date_time.day }}{{ ansible_date_time.month | upper }}{{ ansible_date_time.year }}"
+
+  tasks:
+
+    - name: Backup existing resolved.conf
+      copy:
+        src: /etc/systemd/resolved.conf
+        dest: "/etc/systemd/resolved.conf.bak.{{ date_suffix }}"
+        owner: root
+        group: root
+        mode: '0644'
+        remote_src: yes
+      ignore_errors: yes
+
+    - name: Configure system DNS servers
+      lineinfile:
+        path: /etc/systemd/resolved.conf
+        regexp: '^#?DNS='
+        line: "DNS=10.86.1.1 10.86.2.1"
+      register: dns_update
+      ignore_errors: yes
+
+    - name: Configure search domains
+      lineinfile:
+        path: /etc/systemd/resolved.conf
+        regexp: '^#?Domains='
+        line: "Domains=sandisk.com corp.sandisk.com"
+      register: search_update
+      ignore_errors: yes
+
+    - name: Restart systemd-resolved
+      systemd:
+        name: systemd-resolved
+        state: restarted
+      ignore_errors: yes
+
+    - name: Recreate resolv.conf symlink
+      file:
+        src: /run/systemd/resolve/stub-resolv.conf
+        dest: /etc/resolv.conf
+        state: link
+        force: yes
+      ignore_errors: yes
+
+    - name: Log DNS update
+      import_tasks: log_task_status.yml
+      vars:
+        task_result: "{{ dns_update }}"
+        task_name: "dns_update"
+      ignore_errors: yes
+
+    - debug:
+        msg: "DNS updated successfully via systemd-resolved"
+
+
+##==================================================================================##
+# 4. Chrony Installation and Configuration
+##==================================================================================##
+- name: Install and configure Chrony NTP client
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - chrony
+
+  tasks:
+
+    - name: Check if chronyd command exists
+      shell: "command -v chronyd"
+      register: chronyd_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Stop chronyd service if it exists
+      systemd:
+        name: chrony
+        state: stopped
+      when: chronyd_check.rc == 0
+      ignore_errors: yes
+
+    - name: Install chrony package
+      apt:
+        name: chrony
+        state: present
+      when: ansible_os_family == "Ubuntu"
+      ignore_errors: yes
+    
+    - name: Configure Chrony servers
+      copy:
+        dest: /etc/chrony/chrony.conf
+        content: |
+          # Internal NTP servers
+          server 10.86.1.1 iburst
+          server 10.86.2.1 iburst
+        owner: root
+        group: root
+        mode: "0644"
+      register: chrony installation
+
+    - name: Enable and restart chrony service
+      systemd:
+        name: chrony
+        enabled: yes
+        state: restarted
+      ignore_errors: yes
+
+    - name: Log chrony configuration update
+      import_tasks: log_task_status.yml
+      vars:
+        task_result: "{{ chrony installation }}"
+        task_name: "chrony installation"
+
+
+##==================================================================================##
+# 5. Postfix Installation and Configuration
+##==================================================================================##
+
+- name: Install and configure Postfix
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - postfix
+
+  vars:
+    date_suffix: "{{ ansible_date_time.day }}{{ ansible_date_time.month | upper }}{{ ansible_date_time.year }}"
+
+  tasks:
+
+    - name: Install Postfix package (Debian/Ubuntu)
+      apt:
+        name: postfix
+        state: present
+      when: ansible_os_family == "Debian"
+      register: postfix_install
+      ignore_errors: yes
+
+    - name: Backup existing main.cf
+      copy:
+        src: /etc/postfix/main.cf
+        dest: "/etc/postfix/main.cf.bak.{{ date_suffix }}"
+        owner: root
+        group: root
+        mode: "0644"
+        remote_src: yes
+      register: postfix_backup
+      ignore_errors: yes
+
+    - name: Create new main.cf
+      copy:
+        dest: /etc/postfix/main.cf
+        content: |
+          
+          myhostname = {{ inventory_hostname }}
+          myorigin = /etc/mailname
+          mydestination = $myhostname, localhost.$mydomain, localhost
+          mynetworks = 127.0.0.0/8
+
+          # Relay settings
+          relayhost = [mailrelay.sandisk.com]:25
+          smtp_sasl_auth_enable = no
+          smtp_use_tls = no
+          smtp_tls_security_level = none
+
+          # mailbox and queue settings
+          home_mailbox = Maildir/
+          mailbox_command =
+
+          # Performance and security
+          smtpd_banner = $myhostname ESMTP
+          biff = no
+          append_dot_mydomain = no
+          readme_directory = no
+          compatibility_level = 2
+
+          # Logging and access control
+          smtpd_recipient_restrictions = permit_mynetworks, reject_unauth_destination
+        owner: root
+        group: root
+        mode: "0644"
+      register: postfix_new_cfg
+      ignore_errors: yes
+
+    - name: Enable and restart Postfix service
+      systemd:
+        name: postfix
+        enabled: yes
+        state: restarted
+      ignore_errors: yes
+
+    - name: Log Postfix configuration update
+      import_tasks: log_task_status.yml
+      vars:
+        task_result: "{{ postfix_new_cfg }}"
+        task_name: "postfix_config"
+      ignore_errors: yes
+
+
+    - name: Postfix configured
+      debug:
+        msg: "Postfix has been installed and configured successfully."
+
+
+##==================================================================================##
+# 6. Timezone Configuration
+##==================================================================================##
+
+
+- name: Configure system timezone based on hostname
+  hosts: all
+  become: yes
+  tags:
+    - timezone
+
+  vars:
+    timezones:
+      ULS: "America/Los_Angeles"
+      USE: "America/Los_Angeles"
+      USS: "America/Los_Angeles"
+      USG: "America/Los_Angeles"
+      UIM: "America/Los_Angeles"
+      TBM: "Asia/Bangkok"
+      TBB: "Asia/Bangkok"
+      TPT: "Asia/Bangkok"
+      IKY: "Asia/Jerusalem"
+      CSJ: "Asia/Shanghai"
+      CSS: "Asia/Shanghai"
+      CSF: "Asia/Shanghai"
+      IOI: "Asia/Jerusalem"
+      IBP: "Asia/Kolkata"
+      IBN: "Asia/Kolkata"
+      IBS: "Asia/Kolkata"
+      IBV: "Asia/Kolkata"
+      IBT: "Asia/Kolkata"
+      KSG: "Asia/Seoul"
+      MSK: "Asia/Kuala_Lumpur"
+      MJP: "Asia/Kuala_Lumpur"
+      MPP: "Asia/Kuala_Lumpur"
+      MPL: "Asia/Kuala_Lumpur"
+      MPS: "Asia/Kuala_Lumpur"
+      PBT: "Asia/Manila"
+      JAN: "Asia/Tokyo"
+      JFK: "Asia/Tokyo"
+      JOK: "Asia/Tokyo"
+      JOM: "Asia/Tokyo"
+      JTK: "Asia/Tokyo"
+      JON: "Asia/Tokyo"
+      JYU: "Asia/Tokyo"
+      JOO: "Asia/Tokyo"
+      JTY: "Asia/Tokyo"
+      JYY: "Asia/Tokyo"
+      IBH: "Asia/Kolkata"
+
+  tasks:
+
+    - name: Detect site code from hostname
+      set_fact:
+        site_code: "{{ item }}"
+      loop: "{{ timezones.keys() }}"
+      when: inventory_hostname | upper is search(item)
+
+    - name: Fail if no site code detected
+      set_fact:
+        tz_result:
+          failed: true
+          msg: "No matching location code found in {{ inventory_hostname }}"
+      when: site_code is not defined   
+
+    - name: Set timezone
+      community.general.timezone:
+        name: "{{ timezones[site_code] }}"
+      register: tz_result
+      when: site_code is defined
+      ignore_errors: true
+
+    - name: Log timezone task
+      import_tasks: log_task_status.yml
+      vars:
+        task_result: "{{ tz_result }}"
+        task_name: "Timezone Change"
+
+
+##==================================================================================##
+# 7. Check MK Agent Installation
+##==================================================================================##
+
+- name: Install and configure Checkmk agent (Ubuntu)
+  hosts: all
+  become: yes
+  tags:
+    - checkmk
+
+  tasks:
+    - block:
+        - name: Copy Checkmk agent .deb package
+          copy:
+            src: Packages/check-mk-agent_2.3.0p30.deb   ##change the path 
+            dest: /tmp/check-mk-agent.deb
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Install Checkmk agent
+          apt:
+            deb: /tmp/check-mk-agent.deb
+            state: present
+            disable_gpg_check: yes
+            
+      rescue:
+        - debug:
+            msg: "Checkmk installation failed"
+
+      always:
+        - import_tasks: log_task_status.yml
+          vars:
+            task_result: "{{ ansible_failed_task | default({}) }}"
+            task_name: "Checkmk Agent Install"
+
+
+##==================================================================================##
+# 8. Falcon Sensor Installation
+##==================================================================================##
+
+
+- name: Install and configure Falcon sensor (Ubuntu)
+  hosts: all
+  become: yes
+  tags:
+    - falcon
+
+  tasks:
+    - block:
+
+        - name: Stop falcon-sensor if running
+          systemd:
+            name: falcon-sensor
+            state: stopped
+          ignore_errors: yes
+
+        - name: Remove old Falcon files
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /opt/CrowdStrike/Registry.bin
+          ignore_errors: yes
+
+        - name: Remove old Falcon C-* files
+          shell: "rm -f /opt/CrowdStrike/C-*"
+          args:
+            warn: false
+          ignore_errors: yes
+
+        - name: Copy Falcon sensor .deb package
+          copy:
+            src: Packages/falcon-sensor_7.28.0-1_amd64.deb  ##check if package is available here
+            dest: /tmp/falcon-sensor.deb
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Install Falcon sensor (Ubuntu)
+          apt:
+            deb: /tmp/falcon-sensor.deb
+            state: present
+            disable_gpg_check: yes
+            ignore_errors: yes
+
+
+        - name: Configure Falcon CID
+          command: /opt/CrowdStrike/falconctl -s --cid=06C18613D2124D6CA8757655E830126E-83 -f
+
+        - name: Start and enable falcon-sensor
+          systemd:
+            name: falcon-sensor
+            state: started
+            enabled: yes
+            ignore_errors: yes
+
+        # === Verification Tasks ===
+
+        - name: Verify falcon-sensor process is running
+          shell: "ps -e | grep -e falcon-sensor"
+          register: falcon_process
+          changed_when: false
+          failed_when: falcon_process.rc != 0
+
+        - name: Verify falcon-sensor package is installed
+          shell: "dpkg -l | grep falcon"
+          register: falcon_pkg
+          changed_when: false
+          failed_when: falcon_pkg.rc != 0
+
+        - name: Verify Falcon ports are open
+          shell: "ss -tupan | grep falcon"
+          register: falcon_netstat
+          changed_when: false
+          failed_when: falcon_netstat.rc != 0
+
+      rescue:
+        - debug:
+            msg: "Falcon block failed"
+
+      always:
+        - import_tasks: log_task_status.yml
+          vars:
+            task_result: "{{ ansible_failed_task | default({}) }}"
+            task_name: "Falcon Sensor Install"
+
+  handlers:
+    - name: Restart falcon-sensor
+      systemd:
+        name: falcon-sensor
+        state: restarted
+
+
+##==================================================================================##
+#9. Install common utilities
+##==================================================================================##
+
+- name: Install common utilities
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - common_utils
+
+  tasks:
+    - name: Install common packages (Ubuntu)
+      apt:
+        name:
+          - vim
+          - curl
+          - wget
+          - net-tools
+          - htop
+          - unzip
+          - git
+          - sysstat
+          - openssl
+          - bzip2
+          - iproute2
+          - lsof
+          - nfs-common
+          - pcp
+          - rsync
+          - screen
+          - tcpdump
+          - telnet
+          - tmux
+          - traceroute
+          - zip
+          - zsh
+          - ksh
+
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+      register: common utility package 
+      ignore_errors: yes
+
+    - name: Log common utilities installation
+      import_tasks: log_task_status.yml
+      vars:
+        task_result: "{{ common utility package }}"
+        task_name: "common utility package"
+
+##==================================================================================##
+# PV and VG Setup (Single Disk)
+##==================================================================================##
+
+- name: LVM Setup - Create PV and VG (Single Disk)
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - lvm_setup
+
+  vars_files:
+    - vars/vg_name.yml     # Must contain: vg_name: datavg
+
+  tasks:
+
+    - block:
+
+        #######################################################################
+        # 1. List all available disk devices
+        #######################################################################
+        - name: List available disks
+          shell: "lsblk -dn -o NAME,TYPE | awk '$2==\"disk\" {print $1}'"
+          register: disks_output
+          changed_when: false
+
+        #######################################################################
+        # 2. Select a valid disk (skip sda and sr0)
+        #######################################################################
+        - name: Select candidate disk
+          set_fact:
+            candidate_disk: "{{ disks_output.stdout_lines | reject('match', '^(sda|sr0)$') | list | first }}"
+
+        - name: Convert to /dev/<disk>
+          set_fact:
+            candidate_disk: "/dev/{{ candidate_disk }}"
+          when: candidate_disk is defined and candidate_disk|length > 0
+
+        #######################################################################
+        # 3. Skip LVM if no disk found
+        #######################################################################
+        - block:
+            - debug:
+                msg: "No available data disk found — skipping LVM setup."
+
+            - set_fact:
+                lvm_final_status:
+                  failed: false
+                  skipped: true
+                  msg: "No available data disk found — LVM setup skipped."
+          when: candidate_disk is not defined or candidate_disk|length == 0
+
+        #######################################################################
+        # 4. Check if VG already exists
+        #######################################################################
+        - name: Check if VG already exists
+          shell: "vgs {{ vg_name }} --noheadings"
+          register: vg_exists
+          changed_when: false
+          failed_when: false
+          when: candidate_disk is defined and candidate_disk|length > 0
+
+        #######################################################################
+        # 5. If VG exists → Skip LVM setup and log
+        #######################################################################
+        - block:
+            - debug:
+                msg: "VG {{ vg_name }} already exists — skipping PV/VG creation."
+
+            - set_fact:
+                lvm_final_status:
+                  failed: false
+                  skipped: true
+                  msg: "VG {{ vg_name }} already exists — no changes required."
+          when: vg_exists.rc == 0
+
+        #######################################################################
+        # 6. Create PV and VG only if VG does NOT exist
+        #######################################################################
+        - block:
+
+            - name: Check existing PVs
+              shell: "pvs --noheadings -o pv_name"
+              register: existing_pvs
+              changed_when: false
+
+            - name: Create Physical Volume if not exists
+              shell: "pvcreate {{ candidate_disk }}"
+              when: candidate_disk not in existing_pvs.stdout_lines
+              register: pvcreate_result
+              ignore_errors: yes
+
+            - name: Create Volume Group
+              shell: "vgcreate {{ vg_name }} {{ candidate_disk }}"
+              when: vg_exists.rc != 0
+              register: vgcreate_result
+              ignore_errors: yes
+
+            - name: Set LVM success status
+              set_fact:
+                lvm_final_status:
+                  failed: "{{ (pvcreate_result is defined and pvcreate_result.failed|default(false)) or
+                              (vgcreate_result is defined and vgcreate_result.failed|default(false)) }}"
+                  skipped: false
+                  msg: >
+                    {% if pvcreate_result is defined and pvcreate_result.failed|default(false) %}
+                      PV creation failed.
+                    {% elif vgcreate_result is defined and vgcreate_result.failed|default(false) %}
+                      VG creation failed.
+                    {% else %}
+                      PV/VG setup completed successfully on {{ candidate_disk }}.
+                    {% endif %}
+          when: vg_exists.rc != 0
+
+      rescue:
+        - set_fact:
+            lvm_final_status:
+              failed: true
+              skipped: false
+              msg: "LVM setup failed due to an unexpected error."
+
+      always:
+        - name: Log LVM setup task
+          import_tasks: log_task_status.yml
+          vars:
+            task_name: "LVM Setup (PV & VG)"
+            task_result: "{{ lvm_final_status }}"
+
+
+#==================================================================================##
+# Add SSH keys to authorized_keys
+#==================================================================================##
+
+- name: Add SSH keys to authorized_keys
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - ssh_keys
+
+  tasks:
+    - block:
+        - name: Ensure root .ssh directory exists
+          file:
+            path: /root/.ssh
+            state: directory
+            mode: '0700'
+            owner: root
+            group: root
+
+        - name: copy team SSH keys to authorized_keys
+          copy:
+            src: sandisk_teamkeys/SnDkTeam.keys
+            dest: /root/.ssh/authorized_keys
+            owner: root
+            group: root
+            mode: '0600'
+          register: sshkeys_result
+          
+      rescue:
+        - name: Set failure fact in rescue block
+          set_fact:
+            sshkeys_result: 
+              failed: true
+              msg: "SSH keys addition failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+      always:
+        - name: Log SSH keys addition task
+          import_tasks: log_task_status.yml
+          vars:
+            task_result: "{{ sshkeys_result | default({}) }}"
+            task_name: "SSH Keys Added"
+
+#==================================================================================##
+# Add Sudoers entry for Admin Group
+#==================================================================================##
+
+- name: Add Sudoers entry for Admin Group
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - sudoers_admin_group
+
+  tasks:
+    - block:
+        - name: Ensure admin group exists
+          group:
+            name: sssd_admin
+            state: present
+
+        - name: Add sudoers entry for admin group
+          copy:
+            dest: /etc/sudoers.d/sssd_admin
+            content: |
+              %IT-Infra-Linux-Support-Flash ALL=(ALL:ALL) NOPASSWD: ALL
+              %IT-Infra-Linux-Support ALL=(ALL:ALL) NOPASSWD: ALL
+            owner: root
+            group: root
+            mode: '0440'
+            validate: '/usr/sbin/visudo -cf %s'
+
+      rescue:
+        - name: Handle sudoers configuration failure
+          debug:
+            msg: "Sudoers entry addition failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+
+#==================================================================================##
+# Edit the PAM Configuration for SSHD
+#==================================================================================##
+
+- name: Edit the PAM Configuration for SSHD
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - pam_sshd_modify
+
+  vars:
+    date_suffix: "{{ ansible_date_time.day }}{{ ansible_date_time.month | upper }}{{ ansible_date_time.year }}"
+
+  tasks:
+    - block:
+        - name: Backup existing sshd PAM configuration
+          copy:
+            src: /etc/pam.d/common-session
+            dest: "/etc/pam.d/common-session.bak.{{ date_suffix }}"
+            owner: root
+            group: root
+            mode: '0644'
+            remote_src: yes
+
+        - name: Add pam_mkhomedir.so to common-session
+          lineinfile:
+            path: /etc/pam.d/common-session
+            line: 'session required pam_mkhomedir.so skel=/etc/skel umask=0077'
+            insertafter: EOF
+            state: present
+            backup: yes
+
+      rescue:
+        - name: Handle PAM configuration failure
+          debug:
+            msg: "PAM configuration modification failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+
+#==================================================================================##
+# Install UFW and enable the required ports
+#==================================================================================##
+
+- name: Configure UFW Firewall
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - ufw_setup
+
+  tasks:
+    - block:
+        - name: Install UFW
+          apt:
+            name: ufw
+            state: present
+            update_cache: yes
+
+        - name: Allow SSH port through UFW
+          ufw:
+            rule: allow
+            port: "{{ item }}"
+            proto: tcp
+          loop:
+            - '22'
+            - '80'
+            - '443'
+            - '6556'
+
+        - name: Enable UFW
+          ufw:
+            state: enabled
+            logging: 'on'
+
+        - name: Check UFW status
+          command: ufw status verbose
+          register: ufw_status
+          changed_when: false
+
+        - name: Display UFW status
+          debug:
+            var: ufw_status.stdout_lines
+
+      rescue:
+        - name: Handle UFW configuration failure
+          debug:
+            msg: "UFW configuration failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+
+
+#==================================================================================##
+# Modify SSH Configuration
+#==================================================================================##
+
+- name: Modify SSHD configuration to enhance security
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags:
+    - sshd_config_modify
+
+  vars:
+    date_suffix: "{{ ansible_date_time.day }}{{ ansible_date_time.month | upper }}{{ ansible_date_time.year }}"
+    
+  tasks:
+    - block:
+        - name: Backup existing sshd_config
+          copy:
+            src: /etc/ssh/sshd_config
+            dest: "/etc/ssh/sshd_config.bak.{{ date_suffix }}"
+            owner: root
+            group: root
+            mode: '0644'
+            remote_src: yes
+
+        - name: Ensure PermitRootLogin is set to yes
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?PermitRootLogin'
+            line: 'PermitRootLogin yes'
+            backup: yes
+
+        - name: Disable GSSAPI Authentication
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?GSSAPIAuthentication'
+            line: 'GSSAPIAuthentication no'
+            backup: yes
+
+        - name: Enable GSSAPI Cleanup Credentials
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?GSSAPICleanupCredentials'
+            line: 'GSSAPICleanupCredentials yes'
+            backup: yes
+
+        - name: Restart SSH service to apply changes (Debian/Ubuntu)
+          systemd:
+            name: ssh
+            state: restarted
+          when: ansible_os_family == "Debian"
+
+        - name: Restart SSH service to apply changes (RedHat/CentOS)
+          systemd:
+            name: sshd
+            state: restarted
+          when: ansible_os_family == "RedHat"
+
+      rescue:
+        - name: Handle SSHD configuration failure
+          debug:
+            msg: "SSHD configuration modification failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+
+
